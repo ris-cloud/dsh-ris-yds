@@ -1,0 +1,49 @@
+{
+  "name": "dsh-ris-yds",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "YonBIP YDS local runtime for the DSH agent: config resolution (project settings.json + optional .env), YYCToken, confcenter sync, SOCKS forward, yms-home build/start/stop with JDWP, and dsh-ris-ide run-config integration. Cross-OS (linux/darwin/win32, WSL aware).",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "yds",
+    "yonbip",
+    "yonyou",
+    "yms",
+    "liberty"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./cli": "./lib/cli.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "yds": "bin/yds.js"
+  },
+  "files": [
+    "LICENSE",
+    "README.md",
+    "bin",
+    "cordis.patch.yml",
+    "lib",
+    "native",
+    "resources",
+    "skills",
+    "test",
+    "assets"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  }
+}
