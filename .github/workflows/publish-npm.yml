@@ -4,14 +4,14 @@ name: publish-npm
 # trusted publishing (no npm token, nothing to rotate).
 #
 # How it fits together:
-#   - Jenkins (ris-jenkins/master_dsh-ris-ide, PUBLISH_PUBLIC) pushes a clean
+#   - Jenkins (ris-jenkins/master_dsh-ris-yds, PUBLISH_PUBLIC) pushes a clean
 #     single-commit snapshot + a bare version tag (1.6.9) to Gitee.
 #   - mirror-from-gitee.yml copies branches and tags to this GitHub repository.
 #   - this workflow looks at the newest bare release tag, compares it with the
 #     version npm already has, and publishes the tag only when npm is behind.
 #
-# One-time setup on npmjs.com: package dsh-ris-ide -> Settings -> Trusted
-# Publishing -> GitHub Actions, Owner ris-cloud, Repository dsh-ris-ide,
+# One-time setup on npmjs.com: package dsh-ris-yds -> Settings -> Trusted
+# Publishing -> GitHub Actions, Owner ris-cloud, Repository dsh-ris-yds,
 # Workflow publish-npm.yml, "Allow npm publish" enabled.
 
 on:
@@ -52,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY=https://registry.npmjs.org/
-          PUBLISHED="$(npm view dsh-ris-ide version --registry "$REGISTRY" 2>/dev/null || true)"
+          PUBLISHED="$(npm view dsh-ris-yds version --registry "$REGISTRY" 2>/dev/null || true)"
           echo "npm latest: ${PUBLISHED:-<none>} / tag: $TAG"
           if [ "$PUBLISHED" = "$TAG" ]; then
             echo "npm already has $TAG; nothing to do"

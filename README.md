@@ -11,9 +11,15 @@ YonBIP YDS 客开后端的本地运行时，做成 DSH 插件 + CLI 双形态：
 ## 安装（DSH）
 
 ```bash
+# 公开 npm（推荐）
+dsh plugin --profile web add dsh-ris-yds
+
+# 或从本地 checkout 安装（开发调试）
 dsh plugin --profile web add <本目录>
 # 之后新会话里 agent 就有 yds_* 工具；skills/dsh-ris-yds 会自动同步到项目 .dsh/skills
 ```
+
+装完需**重启 `dsh web`**（宿主插件只在启动时组合一次，工具注册才生效）。
 
 ## 与 dsh-ris-ide 的关系：外挂，只读 + 监听
 
@@ -90,6 +96,69 @@ yds fe url <页面>  # 给页面追加 scriptUrl=http://127.0.0.1:<dev端口>/st
 `yds proxy stop` 会把它们摘掉（条目其余内容恢复成规范形态，用户的其它 configuration 一个字节
 都不动），避免下次 F5 时 java 指向一个已经死掉的本地端口。JDBC 不受此影响：驱动不认 SOCKS，
 仍然只能靠 `127.0.0.1` 同端口映射。
+
+## 不装 dsh-ris-ide 也能用（内置转发器）
+
+本插件不依赖 dsh-ris-ide：
+
+- **有 SOCKS**（`.env` 的 `socks.host/port`）且装了 dsh-ris-ide → 借用它的代理引擎（规则在它的 🌐 面板里
+  可见、可编辑，全机一份）；
+- **没装 dsh-ris-ide** → `yds start` 与 `yds proxy sync|start` 自动回退到随包发布的
+  `lib/socks.js` 内置转发器（`yds proxy status` 会显示「内置转发器: 运行中」，`yds proxy stop` 一并停掉）；
+- **没有 SOCKS** → 直连模式，不需要任何隧道（见下节）。
+
+`yds proxy git-on|git-off` 只改 git 配置，不依赖引擎。
+
+### 反过来：需要 IDE 能力时装 dsh-ris-ide（可选）
+
+本插件只负责 YonBIP/YMS 运行时（YMS 起停、配置、YonCode 补丁、代理规则）；要在同一个 dsh 里
+**启停 Spring Boot / 前端 dev server、看实时日志、用 JDWP 断点调试**，装
+[`dsh-ris-ide`](https://gitee.com/riscloud/dsh-ris-ide) 即可。两者互不依赖：
+`yds doctor` 会发现缺少借用引擎并提示一次（`未检测到 dsh-ris-ide（可选）`），同时自动使用内置
+socks 转发器，**功能不受影响**；装上之后 `yds proxy sync` 会改用它，两边共用同一份规则表与引擎。
+
+## YonCode 直连（不用代理）
+
+`.env` 不写 `socks.host` 就是直连模式，YonCode 端可以完全不用代理栈：
+
+| 环节 | 直连模式下的行为 |
+|---|---|
+| confcenter | 配置里的 DB/Redis 地址原样保留（不改写成 `127.0.0.1`） |
+| `yds start` | 不起内置转发器、不找 dsh-ris-ide 引擎、不启 ProxyBridge、不写 git 代理 |
+| `yds ide apply` | 生成的 `.vscode/launch.json` **不带** `-DsocksProxyHost/-DsocksProxyPort`（F5 的 java 直连内网） |
+| `yds yoncode patch` | 只把网卡校验改成告警；`.env` 没有 socks 时不注入 JVM 代理参数（也可显式 `--no-socks`） |
+
+从代理模式切到直连：删掉 `.env` 里的 `socks.*` → `yds confcenter --offline`（重写直连配置）→
+`yds ide apply`（重写 launch 条目，摘掉代理参数）→ YonCode Reload Window。
+
+### 同一台机器：dsh 走 SOCKS、YonCode 直连（`ide.launch=direct`）
+
+不给 YonCode 配代理、但 dsh（WSL）仍需要隧道时，用 `ide.launch=direct` 把两种模式**物理隔离**，
+而不是复制整套 yms-home：
+
+```ini
+# .env —— socks 保留给 dsh，YonCode 的 F5 走直连
+socks.host=10.3.91.121
+socks.port=1080
+ide.launch=direct
+```
+
+```bash
+yds confcenter          # 写两份：config/（127.0.0.1 适配，给 dsh）+ config-direct/（原始地址，给 YonCode）
+yds ide apply           # launch 条目改为 -Dlocal_conf_path=<ymsHome>/config-direct/，且不带任何 socks 参数
+yds yoncode patch --no-socks   # 或直接 patch：direct 模式下默认不再注入 JVM 代理参数
+```
+
+| | `ide.launch=proxy`（默认） | `ide.launch=direct` |
+|---|---|---|
+| YonCode JVM 参数 | `-DsocksProxyHost/-DsocksProxyPort` | 无代理参数；有 socks 时加 `-Dlocal_conf_path=<ymsHome>/config-direct/` + `-Dyms_use_local_conf=true` |
+| YonCode 读的配置 | `yms-home/config`（127.0.0.1 映射） | `yms-home/config-direct`（原始地址）；没有 socks 时就是 `config` |
+| `yds confcenter` 写 | 只写 `config/` | 同时写 `config/` 与 `config-direct/`；没有 socks 时删除 `config-direct/` |
+| `yds yoncode patch` | 注入 JVM 代理参数 | 不注入（`--no-socks` 行为，成为默认） |
+
+两种模式**不会互相串**：launch 条目每次由 `yds ide apply` 整体重写（切回 proxy 会移除
+`local_conf_path`），配置目录按模式分开写，`yds confcenter` 在没有 socks 时会主动删掉过期的
+`config-direct/`。`yds ide apply` 的输出里有一行 `launch 模式: …` 说明当前生效的是哪一套。
 
 ## 引擎生命周期：随 dsh 退出停止
 

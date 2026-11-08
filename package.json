@@ -1,8 +1,16 @@
 {
   "name": "dsh-ris-yds",
   "version": "0.1.0",
+  "description": "YonBIP YDS local runtime for the DSH agent: config resolution (project settings.json + optional .env), YYCToken, confcenter sync, SOCKS forward, yms-home build/start/stop with JDWP, and dsh-ris-ide run-config integration. Cross-OS (linux/darwin/win32, WSL aware). · YonBIP YDS 本地运行时：项目配置解析（settings.json / .env）、YYCToken、confcenter 拉取、SOCKS 转发、yms-home 构建与启停（含 JDWP 调试）、dsh-ris-ide 启动器集成；跨平台（linux/darwin/win32，识别 WSL）。",
   "license": "MIT",
-  "description": "YonBIP YDS local runtime for the DSH agent: config resolution (project settings.json + optional .env), YYCToken, confcenter sync, SOCKS forward, yms-home build/start/stop with JDWP, and dsh-ris-ide run-config integration. Cross-OS (linux/darwin/win32, WSL aware).",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ris-cloud/dsh-ris-yds.git"
+  },
+  "homepage": "https://gitee.com/riscloud/dsh-ris-yds#readme",
+  "bugs": {
+    "url": "https://gitee.com/riscloud/dsh-ris-yds/issues"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -16,6 +24,7 @@
   "type": "module",
   "main": "lib/index.js",
   "dsh": {
+    "manifestVersion": 1,
     "bundle": {
       "patch": "cordis.patch.yml"
     }
@@ -41,9 +50,11 @@
     "assets"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=18",
+    "dsh": ">=0.2.0-rc.2"
   },
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test \"test/*.test.mjs\"",
+    "check:listing": "node bin/check-listing.mjs"
   }
 }

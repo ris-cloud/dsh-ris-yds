@@ -13,3 +13,7 @@
 
 # 强制 Windows 批处理文件在检出时使用 CRLF
 *.bat text eol=crlf
+
+# 预编译二进制（Rust 原生模块 / Chrome 扩展包）：禁止行尾转换与文本 diff
+*.node binary
+*.crx binary
