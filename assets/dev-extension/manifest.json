@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "ris-yds-extension",
+  "version": "0.1.0",
+  "description": "把工作台页面里本模块的接口路由到本机 YMS（rdbga 请求头），并把 extend 资源换成 127.0.0.1 上的 webpack dev server。配置由本机 yds 动态提供。",
+  "permissions": ["declarativeNetRequest", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "sw.js", "type": "module" },
+  "action": { "default_title": "ris-yds-extension", "default_popup": "popup.html" }
+}
