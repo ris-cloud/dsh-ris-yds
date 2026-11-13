@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ris-yds-extension</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; padding: 12px 14px; width: 320px; font: 13px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+    dl { display: grid; grid-template-columns: 76px 1fr; gap: 3px 8px; margin: 0 0 10px; }
+    dt { opacity: .65; }
+    dd { margin: 0; word-break: break-all; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+    .state { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .on { background: #1e6f2e; color: #fff; }
+    .off { background: #b3261e; color: #fff; }
+    .error { color: #b3261e; margin: 0 0 10px; }
+    button { width: 100%; padding: 6px 10px; margin: 0 0 8px; font: inherit; border-radius: 6px; border: 1px solid #8884; background: #8881; cursor: pointer; }
+    button:active { transform: translateY(1px); }
+    .hint { margin: 0; font-size: 11px; opacity: .6; }
+  </style>
+</head>
+<body>
+  <h1>ris-yds-extension <span id="state" class="state off">…</span></h1>
+  <dl>
+    <dt>模块</dt><dd id="module">—</dd>
+    <dt>工作台</dt><dd id="workbench">—</dd>
+    <dt>前端端口</dt><dd id="fePort">—</dd>
+    <dt>rdbga</dt><dd id="rdbga">—</dd>
+    <dt>来源</dt><dd id="source">—</dd>
+    <dt>同步于</dt><dd id="syncedAt">—</dd>
+  </dl>
+  <p id="error" class="error" hidden></p>
+  <button id="sync" type="button">立即同步（从本机 yds 重新取值）</button>
+  <p class="hint">配置由 `yds fe extension` 生成，值跟随项目；改端口/工作区后点一次同步即可。</p>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,479 @@
+# dsh-ris-yds 开发手册
+
+本文是**实现与维护**文档：架构、模块职责、内部机制、测试与发版。面向使用者的「能做什么 /
+怎么装 / 常用命令」见 [README.md](README.md)；两边不重复，机制细节只放这里。
+
+> 本仓库约定：`README.md` 只描述能力与使用方式；具体逻辑（借用引擎、系统层拦截、配置改写、
+> 外部 IDE 补丁、cookie 校准等）一律写在本文。
+
+## 1. 定位与设计原则
+
+- 一个包、两种形态：DSH 宿主插件（14 个 `yds_*` 工具）与 CLI（`bin/yds.js`，命令 `yds`），
+  共用 `lib/` 同一套实现。CLI 也用作 dsh-ris-ide 程序条目的 `startCommand` 目标。
+- 零运行时依赖：`dependencies` 为空；跨平台能力靠 `native/yds-rust.<platform>-<arch>.node`
+  （6 平台，已提交二进制）与 `assets/`（浏览器扩展包）。
+- 零硬编码：所有主机/端口/模块名/凭据都来自项目 `.vscode/settings.json`（只读）、
+  工作区 `.env`（可选）、环境变量；写操作只落在 `yms-home/`、`.dsh-ris-yds/`、
+  `.dsh-ris-ide/config.json`（仅自己的条目）、`.vscode/launch.json`（仅同名条目）
+  以及工作台域的 `rdbga` cookie。
+- 可选依赖 dsh-ris-ide，但不强依赖：缺它时退回随包内置的 socks 转发器；
+  两个插件可各自单独安装、单独工作。
+
+## 2. 模块地图
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `lib/cli.js` | ~1000 | 命令分发、`yds` 全部子命令、`prepareStart` 生命周期编排 |
+| `lib/config.js` | ~550 | 配置解析（settings.json / .env / env）、键表、`problems`、`describeConfig` |
+| `lib/ide.js` / `lib/ide-proxy.js` | ~700 / ~680 | ris-ide 集成（launch 条目、监听）+ 代理引擎桥接（借用/回退、规则、git） |
+| `lib/yms.js` | ~300 | yms-home 构建、启动/停止、pidfile 身份校验、就绪探测 |
+| `lib/confcenter.js` | ~380 | 平台配置拉取与本地适配（4 文件、direct 副本、原子写） |
+| `lib/browser.js` | ~430 | DevTools 端口探测、`rdbga` cookie 体检/校准 |
+| `lib/socks.js` | ~260 | 内置 SOCKS 转发器（无 ris-ide 时的回退档） |
+| `lib/yoncode.js` | ~250 | 外部 IDE（YonCode）扩展包兼容补丁：网卡校验降级、JVM 代理注入 |
+| `lib/fe-dev.js` | ~170 | 前端调试规则生成（扩展/CDP 共用的 7 条 + scriptUrl） |
+| `lib/dev-extension.js` | ~260 | 生成「ris-yds-extension」扩展目录、dev-config 端点、说明页 |
+| `lib/dev-browser.js` | ~275 | 独立 profile 的调试浏览器（`--load-extension` + `--remote-debugging-port`、pidfile 身份校验） |
+| `lib/index.js` | ~267 | 宿主插件入口：`ctx.tools.register` 注册 14 个工具、skill 同步 |
+
+约 5.4k 行，无构建步骤（纯 ESM，`type: module`，`main: lib/index.js`）。
+
+## 3. 配置解析（`lib/config.js`）
+
+优先级：项目 `.vscode/settings.json`（`yds.*`，只读）**高于** 工作区 `.env`，`.env` 高于环境变量。
+`.env` 的键**不带插件前缀**（与 YonCode 共用工作区时同一份文件）。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `socks.host` / `socks.port` | 空 | 都空 = 直连；有值 = 代理模式（`socks=null` 即直连） |
+| `socks.dbPort` / `socks.redisPort` | 1521 / 6890 | 本机映射端口 |
+| `local.ymsHome` | `<project>/yms-home` | 运行时目录（`YMS_HOME` 亦可） |
+| `local.bindAddress` / `local.serverPort` | 项目 `yds.*` / 31010 | 回调地址与端口 |
+| `ide.launch` | `proxy` | `proxy` / `direct`，非法值进 `problems` 并回退 `proxy` |
+| `proxy.engine` | `auto` | `self` 强制内置转发器（`YDS_IDE_PROXY=none` 亦禁用借用） |
+| `proxy.listenPort` | 0（自动） | 借用引擎时的 listen 端口 |
+| `proxy.javaRules` | off | `on` 时让系统层拦截也覆盖 java 进程（默认不覆盖，见 §6.4） |
+| `git.proxy` / `git.url` / `git.token.*` / `git.commit` | auto / 空 / 空 / `never` | git 代理与只读约束 |
+| `maven.repo` / `maven.settings` | 空 | 构建 yms-home 用（默认 settings 会被内网 mirror 劫持时显式指定） |
+| `yoncode.home` | 空 | 外部 IDE 安装目录（`YONCODE_HOME` 亦可） |
+
+派生字段：`configDir = <ymsHome>/config`、`configDirectDir = <ymsHome>/config-direct`、
+`launchMode`。`describeConfig()` 打印生效键值+来源（凭据打码），`problems[]` 收集非法值。
+
+## 4. 平台配置管线（`lib/confcenter.js`）
+
+- 从 confcenter 拉 4 个文件：`yonbip_config.json`(~89KB)、`yms_middleware.json`(~208KB)、
+  `module_config.json`(269B)、`ip_node_mapping.json`(~18KB) + `variables/default.properties`。
+- 适配：DB/Redis 地址改写成 `127.0.0.1:<dbPort/redisPort>`（仅 socks 模式）；
+  `ip_node_mapping` 合并本机模块条目（解析失败先备份 `.bak-*` 再重建，不清空其它模块）；
+  写 `adapt-version` 与 variables。
+- 写入：`adaptAndWriteConfig(cfg, files, { rewrite = true, dir = null })`，`dir` 缺省
+  `<ymsHome>/config`；tmp+rename 原子写，目录 0o700 / 文件 0o600。
+- **直连副本**：socks 配置时同时写 `config-direct/`（`rewrite:false`，原始地址）；
+  无 socks 时 `rmSync(configDirectDir)` 删过期副本。只有 `ide.launch=direct` 读它。
+- 缓存：`.dsh-ris-yds/confcenter/`，`--offline` 用缓存（网络不可达时启动依赖它）。
+
+## 5. 构建与启动（`lib/yms.js`）
+
+- `yds build`：从零构建 `yms-home`（首次从 jfrog 下 ~77MB kernel，约 19 分钟；缓存后约 1 分钟）。
+  用 `mvn -s <maven.settings>`（默认 settings 的 riscloud mirror 会劫持 central）；
+  JDK 由 `.env` 的 `java.path` / `maven.*` 指定，否则 PATH。
+- 启动：`yms-home/bin/startup.sh` 里 `YMS_USE_LOCAL_CONF="-Dapp.metainfo.start_mode=static
+  -Dlocal_conf_path=${YMS_HOME_DIR}/config/ -Dyms_use_local_conf=true"`——这就是
+  「另指配置目录」的机制，也是模式隔离（§7）能只复制配置、不复制 yms-home 的依据。
+- JVM 参数：引号感知 split；`--jvm-args` 透传；`${JDWP_ARGS}` 占位符由 ris-ide 调试启动替换。
+- 就绪：等端口 120s（含 `/ _yms/ready` 探测），失败回滚（清 pidfile + TERM + 停转发器）；
+  启动前做 socks 握手 + CONNECT 预检，不可用快速失败。
+- 停止：pidfile 经命令行身份校验（`lib/proc.js`：Linux/WSL 读 `/proc/<pid>/cmdline`，
+  Windows 用 PowerShell CIM 的 `Get-CimInstance Win32_Process`；java 认 `YMSLauncher`、
+  node 认 `socks-fwd`）才发信号；陈旧 pidfile 清理，pid 复用不误杀；
+  POSIX TERM→30s→KILL，Windows 走 `taskkill /PID <pid> /T /F`（整棵树）。
+
+## 6. 内网访问子系统
+
+### 6.1 引擎的四个档位（`lib/ide-proxy.js` + `lib/risd-peer.js`）
+
+1. **risd daemon**（首选，HTTP）：`probeRisd()` 读 `~/.dsh-ris-ide/risd.json`（token/port，0600）
+   并探 `GET /v1/health`（免认证；`apiVersion` 必须为 1，否则 `api-mismatch`）。
+   可用时 yds 不启动自己的代理引擎，只做三件事：
+   - `POST /v1/proxy`（带 `revision` 做 CAS，冲突时用新 revision 重试一次）写 `source:'yds'` 规则；
+   - `POST /v1/action {action:'start'}` 让 daemon 拉起/复用引擎（它独占 shadows 与桥接）；
+   - `POST /v1/leases` 登记租约，owner 用**长活进程**的 pid（`yds start` 用 YMS 进程，
+     `yds start --foreground` 用 CLI 自己），记录在 `~/.dsh-ris-yds/risd-leases.json`
+     （按 workspace 存 `{id,ownerPid,port}`，0600）——短命的 CLI 退出后引擎仍被租约保活。
+   **例外**：非拦截模式（proxy 模式、系统层拦截没起来）下，YMS 配置里的 DB/Redis 被改写成
+   `127.0.0.1:<dbForwardPort>/<redisForwardPort>`，而 daemon 引擎的 127.0.0.1 映射是同端口映射，
+   覆盖不到这两个端口 —— 所以内置 SOCKS 转发器仍会作为兜底映射启动，此时机器上是
+   **daemon 引擎 + 内置转发器两个进程**。拦截模式下只写规则，不起转发器。
+   `yds stop`：释放租约 + 从**全局规则表**里移除全部 `source:'yds'` 行，**不主动停引擎**
+   （机器共享，IDE 可能还在用）；系统层拦截若在跑由 daemon 在写规则时重载，重载失败只提示
+   「需手动重启桥接」，不主动停拦截。若 daemon 配置为「无租约即拆除代理」且 yds 是最后一个
+   租约持有者，daemon 会在约 300ms 后自拆。
+2. **借用 dsh-ris-ide 引擎**（无 daemon 时）：`loadIdeProxy(cfg)` 依次尝试 `YDS_IDE_PROXY`、
+   `<ws>/node_modules/dsh-ris-ide/lib/proxy.js`、`<ws>/work/dsh-ris-ide/lib/proxy.js`、
+   `<ws>/../dsh-ris-ide/lib/proxy.js`、`~/.dsh/profiles/web/node_modules/dsh-ris-ide/lib/proxy.js`；
+   要求导出 `startProxy` + `mergeConfigs`，否则视为不完整。`yds stop` 同样只撤规则、不停引擎。
+3. **内置转发器**（`lib/socks.js`）：前两档不可用时由 `prepareStart` 调 `startForwarder(cfg, targets)`；
+   `isForwarderUp` 幂等。
+4. **直连**：`socks=null` 时什么都不起；confcenter 保持原始地址。
+
+开关：`YDS_RISD=none` 禁用第 1 档；`cfg.proxyEngine==='self'` 或 `YDS_IDE_PROXY=none` 跳过第 2 档；
+daemon home 取 `DSH_RIS_IDE_PROXY_HOME || YDS_RISD_HOME || ~/.dsh-ris-ide`。
+测试：`test/risd-tier.test.mjs` 用假 daemon（HTTP）验证发现/ CAS 重试/租约/停而不拆。
+
+### 6.2 规则生成与写入
+
+- 规则 **只写真实程序**：Windows 侧 `java.exe` / `git.exe`（内网 /24 整段、`git.url` 主机），
+  非 Windows（含 WSL）再加**本地侧**的同 host 规则 `java` / `git`（ProxyBridge 在 Linux 侧匹配的是
+  裸进程名，只写 `.exe` 会导致 WSL 里的 JVM 不被拦截）。行上的 `side: 'windows'|'local'` 标明属于哪一侧，
+  面板按它展示；win32 上只生成 `.exe` 两条。以及外部 IDE 的 `java`/`git` 路径规则（带 `label`，
+  路径在项目外，靠 `*` 通配版本目录）。
+- 端点本身不生成规则行（程序名匹配不到进程）。
+- 表是**全局一张表** `~/.dsh-ris-ide/proxy.json`（`DSH_RIS_IDE_PROXY_HOME` 可改），不区分 workspace；
+  面板保存即整表覆盖。yds 的写入也遵循整表契约：读现有表 → 保留**非 yds 行** → 用本次的 fresh yds 行
+  整体替换 `source:'yds'` 行 → 提交完整表；`yds stop` 就是提交「不含 yds 行」的完整表，
+  因此会移除其它项目先前注入的 yds 行（全局表没有交叉配置，这是预期语义）。
+  分组键是 `${side ?? ''}|${programKeyOf(program)}`：同一侧、同一程序的 `java.exe` 与 `java` 是**两行**，
+  同 key 的 fresh 行合并（hosts/ports 并集、`enabled` 任一开、`shadow`/`direct` 全部同意才算开）；
+  `programKeyOf` 对含 `*`/`?` 的 program 返回 `raw:<lower>`，不会把不同通配程序并成一条。
+  其它 source 的行原样保留。risd 档经 `POST /v1/proxy`（CAS、整表覆盖）写；借用引擎档经
+  `mergeConfigs(..., { replaceAllRules: true })` + 完整表写 `proxy.json`（不再用 `replaceRulesFrom`），
+  两档行为一致。
+- 规则变化后：risd 档由 daemon reload 引擎；借用引擎档在引擎运行时重启引擎；否则幂等。
+
+### 6.3 影子监听（shadows）与 git 代理
+
+- 引擎在 `127.0.0.1:<同端口>` 起兜底监听（Oracle/Redis/kafka/ES/license，由端点推导），
+  写在配置 `shadows`（引擎输入，界面不显示）；系统层拦截生效后 `shadows` 为空、不绑端口。
+- git 代理两侧都写：`git config --global http.https://<克隆URL主机>/.proxy socks5h://<socks>`
+  （WSL 侧直接写，Windows 侧用 `git.exe config --global`）。必须 `socks5h`（代理端解析 DNS）。
+  只 scope 到克隆 URL 主机；`git.proxy=off` 关闭。
+
+### 6.4 系统层拦截（ProxyBridge）
+
+- `yds start` 顺带确保 ProxyBridge 在跑（提权走 UAC/免密 sudo）；`yds stop` 清 git 代理、
+  撤规则；系统层拦截若在跑则按剩余规则**重载**（失败只提示「需手动重启桥接」），**不直接停**——
+  它也可能正被 IDE 使用。引擎本身归 risd/借用引擎所有，`yds stop` 不停它。
+- 按**进程名**在系统层改路，可覆盖 Navicat、IDE 里的 java、终端 git；
+  `127.0.0.1` 映射与启动注入只是它没跑时的后备。
+- **默认不拦 java**：WinDivert 路径下 Oracle TNS 首包会被 reset
+  （`T2C7Oversion.doOVERSION` → `SQLRecoverableException: Connection reset by peer`），
+  YMS 起不来；JVM 自己走 SOCKS 是普通 TCP（WSL 侧一直正常）。需要系统层覆盖其它 java 进程时
+  `.env` 写 `proxy.javaRules=on` 再 `yds proxy sync`。git 仍由系统层 + git config 双保险。
+- Windows 细节：GUI 服务的 `ProxyBridgeSvc` 与 CLI 互斥（抢 WinDivert），启动 CLI 前先停服务，
+  停过的记录在 `proxybridge-service.json`，stop 时恢复；遗留 `ProxyBridge_CLI.exe` 先结束再接管；
+  CLI 无日志开关，stdout 重定向 `%TEMP%\dsh-ris-proxybridge.log`，起不来时日志尾部进错误。
+  成功标志：日志出现 `java.exe ... -> <redis> via Proxy SOCKS5://...`。
+- vendor 随包：`~/.dsh-ris-ide/proxybridge/vendor/{linux,windows}/`；WSL 与 Windows 是两个
+  独立进程、各用各的 profile。`yds proxy redirector [status|sync|start|stop]` 是手动入口。
+- 体量：引擎约 700 行（ris-ide `lib/proxy.js`），本插件桥接约 260 行（只做规则/配置/git）。
+
+## 7. 两种使用模式（`proxy` / `direct`）与隔离
+
+- `ide.launch=proxy`（默认）：外部 IDE 的 JVM 带 `-DsocksProxyHost/-DsocksProxyPort`，
+  读 `yms-home/config`（127.0.0.1 适配）。
+- `ide.launch=direct`：JVM **不带任何代理参数**；有 socks 时加
+  `-Dlocal_conf_path=<ymsHome>/config-direct/` + `-Dyms_use_local_conf=true`，读原始地址副本。
+- 唯一参数来源：`lib/ide.js` 的 `launchModeVmArgs(cfg)`（proxy → `proxyVmArgs`；
+  direct+socks → local_conf_path；direct 无 socks → `[]`）。`ourLaunchEntry` 只调它。
+- 切换：`applyLaunchConfig` 整体重写条目（proxy→direct 去 socks flags，direct→proxy 去
+  `local_conf_path`），无残留；`yds confcenter` 写两份/删过期副本；`yds ide apply` 输出
+  `launch 模式: …` 且缺 `config-direct` 时给 ⚠️。
+- `yds yoncode patch` 默认跟随模式：direct 时等价 `--no-socks`（默认不再注入 JVM 代理参数），
+  避免 F5 时把两种模式混在一起。
+- 回归测试：`test/mode-separation.test.mjs`（6 条）钉住「flags / 配置目录 / 切换无残留 / 非法值
+  回退」。
+
+## 8. IDE 集成（dsh-ris-ide）
+
+- `yds ide apply`：
+  1. 往 `.dsh-ris-ide/config.json` upsert 一条启动器条目（`id: yds:<项目名>`，
+     `startCommand: node <插件>/bin/yds.js start --foreground --jvm-args "${JDWP_ARGS}"`）；
+     文件不存在时按 ris-ide 自己生成的格式初始化（`version/defaults/programs`）。
+  2. 条目名：java 项目取 `parent.artifactId`（bootstrap pom），前端项目取平级
+     `module.xml` 的 `module.name`（如 `c-ass-kk-hans-fe`）；老内部名就地改名，避免重复行。
+  3. 禁用被启动器取代的后端行，其它行原样保留（ris-ide 的合并/删除语义不受影响）。
+  4. 维护 `.vscode/launch.json` 的 `yms-middleware-cloudnative-jdk-21` 条目（与 YonCode
+     `ensureLaunchConfig` 同名同构）：`mainClass iuap.yms.YMSLauncher`、`cwd`=`${config:yds.ymsHome}`、
+     classPaths 指 `yms.jar`、7 个 `--add-exports` + 16 个 `--add-opens`、`env.YDS_STATE`=
+     `${command:yds.preLaunch}`；JSONC 读取（注释/尾逗号/字符串感知状态机），只 upsert 同名条目。
+- `lib/ide-watch.js`：注册工作区后监听 `.dsh-ris-ide/config.json`（`fs.watch` + 2s 轮询兜底，
+  400ms 去抖）；ris-ide 初始化或点「生成/覆盖配置」把它冲掉或改名时自动补回。
+  登记在 `~/.dsh-ris-yds/ide-watch.json`（机器级，多工作区）；宿主进程内运行，改代码需重启 dsh。
+  事实校正（2026-11-11 升级复核）：当前 ris-ide 的「更新配置」走 `mergeConfigDocuments`，会原样保留
+  带 `startCommand` 的行 ⇒ 普通 update **不再**冲掉 yds 行；监听现在只兜底 generate/overwrite 与旧版
+  ris-ide，不是 yds 行能活下来的唯一原因。
+- 调试链路：`yds ide apply` 写入的 `startCommand` 含 `${JDWP_ARGS}`，之后用
+  `ris_dev_debug` / `ris_dev_start` / `ris_dev_stop` 标准启停调试。
+
+## 9. 外部 IDE 兼容补丁（`lib/yoncode.js`）
+
+YonCode 要求 `yds.serverBindAddress` 是本机网卡 IP，否则启动即失败（`Invalid IP address, no
+interface found with address …`）；而本插件的回调地址常常是 NAT/端口转发/WSL 外的地址，所以要把
+这个校验降级为告警。
+
+- `yds yoncode`（status）：识别 `patched` / `unpatched` / `unrecognised`（不认识的版本不猜）/
+  `absent`（正常）；安装目录按 `.env` 的 `yoncode.home` / `YONCODE_HOME` 定位，指定了就只看这一处。
+- `yds yoncode patch`：改扩展包两处（同一份 `.bak`）：
+  1. `throw` → `console.warn`（网卡校验降级）；
+  2. YMS 启动 `vmArgs` 追加 `-DsocksProxyHost/<port>`（为绕开 §6.4 的 TNS reset）。
+     幂等；写不动时报「需要管理员或 danger-full-access」，不静默失败。
+- `yds yoncode revert`：从 `.bak` 还原。
+- `yds ide apply` 时自动检查，未打补丁在输出末尾提示；`yds doctor` 有一行 `yoncode: …`。
+  只改 YonCode 自身文件，不碰项目；YonCode 升级重写该文件，重跑一次 patch 即可。
+
+## 10. YYCToken（`lib/token` + `native/`）
+
+`yds token <url>` 用捆绑的 `native/yds-rust.<platform>-<arch>.node`（6 平台）生成 YYCToken；
+密钥派生在原生模块里，凭据来自项目 settings，不依赖外部 IDE。原生模块经 `pathToFileURL` 加载
+（Windows 盘符/空格路径安全）。
+
+## 11. 前端调试（`lib/fe-dev.js` + `lib/dev-extension.js`）
+
+远端页面从平台加载 `/<module>/…/javascripts/extend*.min.js`，本地开发要换成
+`http://127.0.0.1:<fe.port>/static/…`。三条路（规则里的模块名/工作台主机/端口全部来自项目配置）：
+
+1. `yds fe extension` → 把 `assets/dev-extension/` 拷到 `<workspace>/.dsh-ris-yds/dev-extension`
+   并写 `config.json`（只有 `{workspace, dshPort}`）；扩展的 `sw.js` 从
+   `GET /dsh-ris-yds/dev-config?workspace=…` 拉 rdbga/module/工作台/端口，生成
+   `declarativeNetRequest` 动态规则（3 条重定向 + 1 条 `rdbga` 请求头），每 2 分钟与弹窗手动同步；
+2. `yds fe plan` → 同样 7 条换成 `{regex, substitution}`，给 agent 用 CDP `Fetch` 注入；
+3. `yds fe url <page>` → 追加 `scriptUrl=http://127.0.0.1:<dev端口>/static`（零配置）。
+
+为什么不再带 `.crx`/Resource Override：`.crx` 需要签名与商店/策略安装，且第三方扩展随时可能改匹配规则；
+自研扩展的匹配规则由 `assetRules()` 生成、值由端点下发，插件升级即可刷新（不需要重新打包）。
+
+端口来源：`.vscode/settings.json` 的 `yds.webConfig[*].yds.localDevUrl` → 前端工程的
+`resource_override_rules.json` → 3004 兜底。
+
+## 11.1 专用调试浏览器（`lib/dev-browser.js`）
+
+普通浏览器不暴露 DevTools 端口、也没法从进程外 `--load-extension`，所以 yds 自己起一个可控实例：
+
+- 独立 profile：`YDS_BROWSER_PROFILE` 或 `~/.dsh-ris-yds/browser-profile`（不碰日常浏览器）；
+- 启动参数：`--user-data-dir` / `--load-extension=<workspace>/.dsh-ris-yds/dev-extension`
+  （目录不存在就先生成）/ `--remote-debugging-port`（默认 9222）/ 关首启与后台网络，URL 放最后；
+- 浏览器可执行文件：`YDS_BROWSER_PATH` → 平台候选（Windows/macOS/Linux 的 Chrome/Edge/Chromium）→ `$PATH`；
+- 记录 `<state>/browser.pid`（JSON：pid/port/profile/extension/binary/startedAt），`stop` 前用
+  `pidIdentity(pid, [basename(binary)])` 校验身份：只停自己起的，外来/未知进程拒绝并保留记录；
+- 端口上已有可连接实例时返回 `reused:true`，不重复拉起；并把这台的登录 cookie 快照刷新一遍。
+- **用真实 Chrome，不用 Chrome for Testing**：候选顺序把用户级 Chrome
+  （`~/.local/opt/google-chrome/opt/google/chrome/chrome`）排在前面；`$PATH` 命中的构建若
+  `realpath` 含 `ms-playwright|chrome-linux64|headless_shell|chrome-for-testing` 则排到最后。
+  原因：CfT 窗口顶部有 "Download Chrome" 横幅，会遮住平台页面按钮。
+- **中文界面**：Chrome/Linux 的窗口语言来自 gettext 环境变量（`LANGUAGE`/`LC_ALL`），
+  `--lang` 只设网页 Accept-Language。`browserEnv(env, lang)` 因此给子进程注入
+  `LANGUAGE=zh_CN`（系统 locale 为 C/POSIX 时再补 `LANG/LC_ALL=zh_CN.UTF-8`），默认
+  `zh-CN`、`YDS_BROWSER_LANG` 覆盖、置空则完全跟随系统。**不要用装字体去解决 UI 语言**。
+- **登录态**：平台登录是 session cookie，关浏览器即失效。`saveCookies`/`restoreCookies`
+  （CDP `Network.getAllCookies` + `Storage.setCookies`）在复用与 `stop` 前写
+  `<workspace>/.dsh-ris-yds/browser-cookies.json`（0600）；启动时若快照存在，先以
+  `about:blank` 起、恢复 cookie 后再开目标页（否则登录页会抢先）。
+- 测试要点：`freePort()` 拿到的端口在 close 回调后约 25ms 内仍可能 connect 成功（会误判为
+  “已有实例”），所以测试先对同一端口轮询到不可连接再启动；假浏览器的脚本末尾要有 `:`，
+  否则 dash 会 exec 最后一条命令、把 pid 的命令行变成 `sleep`，身份校验就认不出来了。
+
+## 12. 浏览器 rdbga 校准（`lib/browser.js`）
+
+网关把请求路由到本机 YMS 的唯一条件：浏览器带着 `rdbga` cookie 且值等于当前 JVM 的 `-Drdbga`。
+失败是静默的（页面照常，请求去远端 pod；`logs/access.log` 空、断点不命中）。
+
+- 端口清单唯一来源 `DEVTOOLS_PORTS`（9222/9223/9224/9333）。
+- `yds browser status`：逐条标「空值 / 值不匹配 / 正确」，打印期望值及其来源。
+- `yds browser fix`：删掉除「唯一且值正确」外的所有 `rdbga`，必要时写入当前值；`--dry-run`
+  只打印计划。写入范围受控：只此一个 cookie、只工作台域（`hostname` 精确匹配），值必须是合法的
+  `module,/context@ipv4:port` base64，写入后回读确认，否则报失败。
+- 期望值优先级：`--rdbga` > 配置推导值；运行中 JVM 的 `-Drdbga` 只用于校验，所有实例都与配置
+  不一致时**拒绝写入**（避免指向不存在的实例）。
+- `yds start` 成功后自动校准一次（后台/前台/已在运行都尝试；端口没开则静默跳过）。
+
+## 13. 生命周期编排（`lib/cli.js` `prepareStart`）
+
+```
+socks 配置 ?
+  ├─ 系统层拦截模式 → syncBorrowedRules（只写规则）
+  └─ 否则          → ensureBorrowedProxy
+                       ├─ mode=ide 且失败 → 直接报错
+                       └─ 其它（未装 ris-ide / engine=self）→ isForwarderUp ? 复用 : startForwarder
+→ syncRedirectorProfile（有适配器才打印桥接状态；不替你提权）
+→ git 代理（git.proxy!=off 且 git.url 存在）applyGitProxy(enabled:true)
+→ 启动 YMS（yms.js）→ 成功后 browser 自动校准
+```
+
+`yds stop` 的实际顺序：停 YMS → 释放 risd 租约 → 从全局规则表移除全部 yds 行（整表提交，见 §6.2；
+输出本次真正减掉的规则/host 数，risd 档 daemon 顺带重载桥接）→ 停内置转发器（`--keep-socks` 保留转发器，其余照做）
+→ 系统层拦截按剩余规则重载
+（risd 档由 daemon 负责，不本地重复 reload）→ 清 git 代理 → `stripLaunchProxy`
+（摘掉 launch.json 里的 socks 参数）。`rollbackForwarder` 供失败回滚：
+`stopBorrowedProxy` + `stopForwarder`，各自 best-effort。
+`yds proxy` 子命令在引擎不可用时不提前失败：`sync|start` 回退内置转发器、`status` 显示其状态、
+`stop` 一定停转发器、`git-on/off` 不依赖引擎（`test/proxy-standalone.test.mjs` 钉住）。
+
+## 14. 安全与健壮性（实现要点）
+
+- 进程身份校验：pidfile 的 pid 经命令行验证（`lib/proc.js`：Linux/WSL `/proc`，Windows PowerShell
+  CIM；java=YMSLauncher、node=socks-fwd）；陈旧 pidfile 清理，pid 复用绝不误杀。
+  **2026-11-09 修复**：此前只读 `/proc`，Windows 上恒判「非本工具进程」⇒ status 永远未运行、
+  start 重复起第二个 YMS/转发器、stop 停不掉（孤儿进程）；现两平台一致。
+  **2026-11-09 再修（评审 D-P1-6/7）**：身份探测改为三态 `probePid`/`pidIdentity`（`ours`/`foreign`/`dead`/`unknown`）——
+  只有 `dead` 或确认 `foreign` 才删 pidfile，`unknown`（EPERM / PowerShell 超时 / 命令行为空）保留 pidfile 并上报
+  `yds status` 身份未确认、`yds start` 拒绝重复启动、`yds stop` 不盲杀；`stopPid` 返回 `{ok,code,error}` 并消费
+  `taskkill` 退出码，停止失败时保留 pidfile 并报 `stopped:false`，不再「报成功」。Windows 探测走单引号 WQL
+  （`-Filter 'ProcessId=N'`，pid 仅整数插值，无注入面），`platform`/`exec`/`signal` 可注入以便单测。
+- **重启与 pidfile 丢失（2026-11-12）**：前台 CLI 退出时会 unlink `yms.pid`，但 Liberty 进程可能还活着；
+  此前 `yds start` 因此再起一个 JVM，被 workarea 单实例限制拒绝（`CWWKE0029E: An instance of server
+  defaultServer is already running`），存活实例反而变成「未运行」。现在：
+  `detectRunningOnPort`（`lib/yms.js` + `lib/proc.js#listenPid`：Linux `ss`→`lsof` 兜底、macOS `lsof`、
+  Windows `netstat -ano`）按监听端口找 owner，再用三态身份校验确认是 YMS；`yds start` 无旗标时**接管**
+  （补写 pidfile）并提示 `--restart`，端口被非 YMS 进程占用则给出原因后中止（不再 spawn 注定的第二个 JVM）；
+  `yds start --restart` 走 `stopForRestart`（pidfile 优先、端口兜底、身份未知绝不误杀）→ 等端口释放 →
+  重新启动，输出「YMS 已重启」。前台模式（`--foreground`，ris_dev_start/ide 用）总是先接管再启动，
+  否则 IDE 侧重复启动同样会撞 `CWWKE0029E`。`test/restart.test.mjs` 覆盖解析、接管、拒绝与重启失败路径。
+- **`.env` 自文档化（2026-11-12）**：仅当 `cfg.projectDir != null`（项目 `.vscode/settings.json` 带 `yds.*` 键
+  才算 yds 项目；scratch/非 yds 目录不碰 `.env`）时，`ensureEnvTemplate`（`lib/config.js`）在 CLI 加载配置后调用，
+  按 `ENV_TEMPLATE` 检查 `git.url`/`socks.host`/`socks.port`/`proxy.javaRules` 四个键；缺失项以**注释占位**
+  追加（`#key=`，含分组标题 `# ---- yds 机器配置（可选）----`），已有键（写的或注释的）一律不重复、不覆盖，
+  文件不存在则直接生成该模板（0600）。向上查找复用 `readSettingsEnv`，命中父目录既有 `.env` 就写那里。
+  只追加、原子写（tmp+rename），只读工作区失败静默（不影响 start/status）。占位未填值时输出
+  `[yds] 待补齐配置（未生效）: …` 供 agent 向用户提问补齐（`envPendingKeys` 用「有未注释且非空的值」判定；
+  `.env` 里出现 `# yds: 配置已确认（无需补齐）` 时停止提醒，但缺失键仍会补占位）。
+  `test/env-template.test.mjs` 覆盖。
+- 启动失败回滚：120s 就绪超时 → 清 pidfile + TERM + 停转发器；socks 预检快速失败。
+- 原子写 + 0600/0700：confcenter 缓存与 config 写入均 tmp+rename；ip_node_mapping 失败先备份。
+- JSONC 解析为字符串感知状态机（`http://`、`,]` 等不被误伤），用户条目 round-trip 无损。
+- 流式输出不缓冲：mvn 19 分钟输出直转 stdout（`ris_dev_logs` 可跟）；`yds logs` 只读尾部
+  ≤256KB；console log 16MB 轮转。
+- 跨 OS：native 经 `pathToFileURL`；Windows 上 mvn 走 `mvn.cmd` + shell；JVM 参数引号感知；
+  `--flag=true` 解析；spawn 全部 `windowsHide`。
+- 脱敏：config/git url 打码 userinfo，描述符 mask `accessSecret`。
+- CLI 失败非 0 退出：`run()` 返回 `exitCode`、由 bin 落地（不设 `process.exitCode`），
+  agent 工具结果带 `ok:false`；未知命令/动作/多余参数在探测端口前拒绝。
+
+## 15. 已知边界与安全（设计取舍，文档化而非代码限制）
+
+- `workbenchUrl` 是**项目级信任根**：来自被开发仓库的 `.vscode/settings.json`，生成的 maven
+  settings 对 jfrog 制品 `checksumPolicy=ignore` ⇒ **不要对不可信仓库执行 `yds build`/`yds start`**
+  （理论上可投毒 77MB kernel）。
+- SOCKS 转发器本机无鉴权：`127.0.0.1:1521/6890` 上本机任何进程都能穿隧道访问内网；单用户机可接受。
+- `yds token` 明文输出 YYCToken（bearer 凭据，进 stdout/日志）——调试用短期凭据，敏感场合自行避免落盘。
+- Windows 停机是硬杀（TerminateProcess，Liberty 无优雅停机）；POSIX TERM→30s→KILL。
+- `yds browser fix` 会改用户浏览器 cookie（仅工作台域 + 仅 `rdbga`，失败静默）；不确定先 `--dry-run`。
+- 直连模式下 `yds start` 不起任何隧道/桥接/git 代理（`test/mode-separation` 覆盖）。
+- `yds start --restart` 只停「可识别的 YMS」：端口被无法读取命令行的进程占用时中止并提示手动处理，
+  与 `yds stop` 的不误杀口径一致。
+
+## 16. 测试
+
+```bash
+npm test              # node --test "test/*.test.mjs"（177 条）
+npm run check:listing # 上架自检 15 项（❌ 必须为 0；⚠️ 需人工确认）
+```
+
+覆盖：`cli`（命令/退出码）、`config`（键表/绑定）、`confcenter`、`yms` 启动、`browser`、
+`fe-dev`、`ide-config`/`ide-watch`（条目 + 监听）、`launch-proxy`（代理参数注入）、
+`mode-separation`（两模式隔离）、`proxy-standalone`（无 ris-ide 回退）、`yoncode`（补丁往返）、
+`ide-contract`（升级闸门：ris-ide 的导出/配置行/launch.json/risd 路由 + 探针 stub 防泄漏；
+没装 ris-ide 时 skip）、`open-site`（注入代理：规则改写、YYCToken、cookie jar、HMR 透传、
+未打包时降级、`/dsh-ris-yds/open` 路由守卫）。
+
+fixture 模式：每个用例 `mkdtemp` 独立工作区 + `stateDir`，写 `.env`/settings.json/confcenter 缓存；
+`YDS_IDE_PROXY=none` 模拟未装 ris-ide。真起进程的用例（内置转发器）用空闲端口并 `finally` 清理。
+
+已知：全量并发下个别真 socket 用例偶发超时，单独跑/重跑通过（与 ris-ide 的同类 flake 一致）。
+
+## 17. 发版
+
+- 版本号规则：`X.Y.Z`，X 只给里程碑；Y 用于不兼容/大改；Z 日常。
+- 本地：`npm test` → `npm run check:listing` → `npm pack`（约 10MB，含 6 平台 `.node` 与 crx）。
+- 仓库内 `Jenkinsfile`：Checkout → Test → Pack → Publish to Nexus（`buildingTag()`，凭据 `nexus`，
+  一次性 `.npmrc`）；无 install/build（无依赖、无构建产物）。
+- `.github/workflows/publish-npm.yml`：OIDC trusted publishing 发公网 npm（取最新纯 `X.Y.Z` tag，
+  与 `npm view` 比较后发布）；`.github/workflows/mirror-from-gitee.yml`：每 2h 从 Gitee 镜像到 GitHub
+  并同步 Release。
+- 正式链路（与 dsh-ris-ide 相同）：gogs 建「版本发布」+ tag → Jenkins（`PUBLISH` + `PUBLISH_PUBLIC`）
+  → Nexus 发布 + 干净快照（单提交）推 Gitee + 同名 tag + Gitee 发行版 → mirror 到 GitHub →
+  GitHub Actions 发公网 npm。
+  对应 Jenkins job：`master_dsh-ris-yds`（从 `master_dsh-ris-ide` 改：无 Install/Build、
+  仓库 `jk.ris.com.cn:30993/haweite/dsh-ris-yds`、Gitee 目标 `riscloud/dsh-ris-yds`、
+  提交信息 `dsh-ris-yds <ver>: public release (clean history)`）。
+- 首次发布前需人工：公开仓库（Gitee/GitHub + topic `dsh-plugin`）、npm 首次
+  `npm publish --access public`、npmjs 配 Trusted Publisher（owner `ris-cloud`、repo `dsh-ris-yds`、
+  workflow `publish-npm.yml`）。
+- 上架（可选）：awesome-dsh-plugin PR + dsh.so submit；README 需安装命令（已有）与 2–4 张截图。
+- 已发布版本：`1.0.0`（首发）；`1.1.0`（Phase 1c：作为租户接入 dsh-ris-ide 的 risd daemon——经 `/v1/proxy` CAS 写规则、登记租约；`yds stop` 只撤自己的规则并释放租约，不再停共享引擎/拦截；`YDS_RISD=none` 可跳过 daemon 档）；`1.1.1`（dsh-ris-ide 升级适配复核：`probeRedirectorStatus()` 摘除宿主测试用的探针门、`test/ide-contract.test.mjs` 把「导出/配置行/launch.json/risd 路由」变成可执行契约；见 §18）；`1.2.0`（浏览器按钮：`lib/open-site.js` 注入代理——本地改写平台 `extend*.min.js|css` 到 dev server、自动带 `YYCToken`（头 + cookie）、HMR/大响应透传；`POST /dsh-ris-yds/open` 供 dsh-ris-ide 的 🌐 调用，见 §19）；`1.2.1`（点名前端的注入：`openSite`/`/open` 接受 `frontend:{code}`，只注入调用方声明、且端口一致的前端——`pickFrontend(webConfig, module, frontendCode)` 不再按 domainKey/第一个猜，不合格返回 `not-yds-frontend`）
+
+
+## 18. 与 dsh-ris-ide 的耦合面
+
+- 只读 + 监听它的 `.dsh-ris-ide/config.json`（§8）；不改它的代码、不需要它知道本插件。
+- 借用它的代理引擎时只依赖导出契约：`mergeConfigs / readProxyConfig / writeProxyConfig /
+  startProxy / stopProxy / proxyPid / proxyStatus`（`lib/proxy.js`）；不可用则走内置转发器。
+- 两个插件可各自单独安装；装在一起时共用同一份代理规则与引擎（不会重复起隧道）。
+- 2026-11-11 升级复核（ing dsh-ris-ide 1.8.2 工作树级改动）：0 处破坏。复核名单 =
+  `lib/proxy.js` 10 个导出、`lib/redirector.js` 6 个导出、`config.json` 往返（`readProgramConfig` /
+  `mergeConfigDocuments` / `configMatchesWorkspace`）、`${JDWP_ARGS}` 替换、`launch.json` JSONC 读取、
+  risd 的 `/v1/health|leases|proxy|action|engine` 与 `x-risd-api-version`。以上全部落成
+  `test/ide-contract.test.mjs`（ris-ide 不可达时 skip）。
+- 复核发现并已处理的两个隐患：① ris-ide 新增的测试用环境门 `DSH_RIS_IDE_STUB_PROBES=1` 会让
+  `redirectorStatus()` 谎报「桥接没在跑」⇒ 统一走 `probeRedirectorStatus()`（调用期间摘掉该变量后还原），
+  `yds stop` 不会再因环境泄漏跳过 reload；② `POST /v1/proxy` 在 daemon 侧 `await` 桥接锁与
+  git reconcile 后才响应，而本插件超时 8s —— 慢路径下可能报「写入失败」但表已落，目前记录不改
+  （真遇到再把 `putRules` 超时提到 ~30s）。
+
+## 19. 浏览器按钮：注入代理（m03945）
+
+dsh-ris-ide 的程序行有 🌐：点它在**系统默认浏览器**里打开该程序（前端 dev server）的页面。
+浏览器标签页无法由页面外的东西加请求头，所以在 yds 项目里这一跳由本插件接管：
+
+- `lib/open-site.js`：本地注入代理。把页面从 `http://127.0.0.1:<devPort+10000>` 发出去，
+  HTML 里注入 `/__yds/inject.js`；脚本 patch `script.src`/`link.href`/`setAttribute`/`fetch`/
+  `XMLHttpRequest.open`，把平台地址改写成 `http://127.0.0.1:<fePort>/static/…`（等价 Resource
+  Override 的那 7 条规则），把工作台域的 ajax 走同源 `/__yds/gw?u=<真实URL>`；Node 侧按真实
+  URL 现签 YYCToken（30s 缓存）再加头发给网关；同一个 token 也放进 `YYCToken` cookie
+  （工作台页面从 cookie 读凭据，头/cookie 两路都发，网关忽略哪一路都无害），并把网关回来的
+  会话 cookie 记住/回放。
+  HMR 的 WebSocket 经 `server.on('upgrade')` 透传；压缩体与 >8MB 的响应不缓冲改写（直接 pipe）。
+- `lib/open-serve.js`：每进程一个 `devUrl|workbenchUrl` → 代理实例的注册表（复用同一个端口，
+  否则每次点按钮都换端口、丢 cookie 与 HMR），插件卸载时 `closeOpenSites()` 关掉。
+- 路由（`lib/index.js`，`ROUTE_PREFIX='/dsh-ris-yds'`，仅 loopback）：`GET /dsh-ris-yds/status?workspace=`、
+  `POST /dsh-ris-yds/open`（`{workspace, devUrl}` → `{ok, url, port, reused}`）。dsh-ris-ide 的
+  `/dsh-ris-ide/open-target` 先要 dev server 地址（从程序日志里解析），再调这里换成带 token 的 URL；
+  本插件没装/没响应时它回落到裸地址——两个插件仍可各自单独安装。
+- 边界：只对**页面自己发起的 ajax / 动态插入的 script|link|img** 生效；整页跳转、图片直连、
+  表单提交仍是浏览器原路径。要覆盖所有站点（而不是经代理打开的那一个标签页），仍需扩展或
+  `--proxy-server` 专用浏览器。
+- 凭据缺失时只注入脚本、不加 token（页面照常打开，只是要登录）。
+- `GET /dsh-ris-yds/probe?workspace=`（m04354）：只回答「这是不是 yds 项目」。`probeWorkspace()` 用
+  `findProjectDir()` 读 `.vscode/settings.json` 里的 `yds.*` 键，列出 `yds.webConfig` 的前端名
+  （`yds.localWorkbenchPort` 不算前端），不解析配置、不找端口、不启动任何监听。dsh-ris-ide 的
+  🌐 只在 `kind:'frontend'` 的行上出现，且只有这里回 `yds:true` 时才在 title 里提 token——
+  普通工作区（或没装本插件）永远不会在界面上看到 yds 字样。
+
+## 20. 启动器条目被 IDE 重建后自动补回（m04506）
+
+`yds ide apply` 会写两样东西：`.dsh-ris-ide/config.json` 里的启动器条目
+（`id: yds:<module>`、`kind: spring`、`startCommand` 跑 `bin/yds.js start --foreground`、`logName=<module>`），
+以及本机的监听登记（`~/.dsh-ris-yds/ide-watch.json`）。ris-ide 在「生成/覆盖配置」时会按 discovery
+重建那份 config，我们的条目它发现不了，于是被丢；监听就是负责补回的那一层
+（`lib/ide-watch.js`：`fs.watch` + 2s 轮询兜底，去抖 400ms；ris-ide 的普通「更新配置」走
+`mergeConfigDocuments` 会保留带 `startCommand` 的行，所以那条路径本来就不会丢）。
+
+**这次的真正原因（用户报「重注入的 c-ass-kk-hans 项目没了，界面上只剩一个没有按钮的 c-ass-kk-hans」）**：
+监听只从登记表读工作区，而 `/home/wangjun/wsdzjg` **从来没被登记**（登记表里只有
+`/home/wangjun/bip-dzjg/workspace` 与一个 /tmp 测试目录）。config 被重建后没人补，剩下一份
+`logs/c-ass-kk-hans.log` 让 ris-ide 把它当 `instance:` 只读行显示——那一行按设计没有任何按钮，
+用户看到的就是它。修复分两层：
+
+1. **监听自己发现该看的工作区**：`discoverWorkspaces()` 读 ris-ide 的窗口镜像
+   `~/.dsh-ris-ide/dsh-window.json`（`windows[].cwd` + `workspaces[].cwd`，只要绝对路径），
+   `watchAll()` 监听「登记表 ∪ 镜像里的工作区」，并且每 10s 重读两张表（`RESCAN_MS`）——
+   新开的工作区、新 `yds ide apply`、新的移除都会在 10s 内生效，不再依赖插件启动那一刻的列表。
+2. **「移除」是决定，不是故障**：`yds ide remove` 除了解登记，还写 `suppressed` 列表
+   （`suppressWorkspace`），监听永远不碰被 suppress 的工作区；`yds ide apply` 视为重新同意，
+   登记时清掉那一项。这样自动发现不会把用户主动删掉的条目又塞回去。
+
+行为：`dev-c-ass-kk-hans-bootstrap` 这类被启动器取代的后端条目由 `applyIdeConfig` 的
+`repairYdsRows` 标成 `disabled: true`（ris-ide 的 `mergeProgramConfig` 跳过 disabled 行），
+所以面板上只留 `c-ass-kk-hans` 一条后端入口。本次用 `applyIdeConfig` 手工修复了 wsdzjg
+（`action: added`、`disabled: [dev-c-ass-kk-hans-bootstrap]`），面板随后只列
+`c-ass-kk-hans-fe / ynf-c-ass-kk-hans / c-ass-kk-hans(yds) / corp-demo`。
