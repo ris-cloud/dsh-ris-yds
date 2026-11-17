@@ -1,0 +1,13 @@
+# dsh-ris-yds bundle patch
+#
+# Tools-only plugin: no browser row, no client bundle. The insert below mounts
+# the plugin so its ctx.tools registrations reach the agent session.
+#
+# Install + mount in one step (from anywhere):
+#
+#   dsh plugin --profile web add <path-to-this-dir>
+#
+# The Loader specifier (`name`) MUST equal the package.json `name`.
+- insert:
+    - id: yds
+      name: 'dsh-ris-yds'
